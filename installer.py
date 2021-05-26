@@ -2,102 +2,192 @@ import os
 
 import subprocess as sp
 import re
+from typing import List, Tuple
 import warnings
 from enum import Enum
 
 from constants import ADB_PATH, IP_MATCHER
 
 
-class DeviceState(Enum):
+class ConnectionState(Enum):
     CONNECTED = "device"
     DISCONNECTED = "offline"
     UNAUTHORIZED = "unauthorized"
 
 
-class Installer:
-    def __init__(self, ip_address, apk_path):
+class ADBError(RuntimeError):
+    def __init__(self, code: int = 1, message: str = None):
+        self.code = code
+        self.message = message
+
+
+class Device:
+    def __init__(self, ip_address, connection_state=ConnectionState.DISCONNECTED):
         super()
         if IP_MATCHER.match(ip_address):
             warnings.warn(
-                f"Cannot create installer with invalid ip adderss: {ip_address}"
+                f"Cannot create device with invalid ip adderss: {ip_address}"
             )
         self.ip_address = ip_address
-        self.call_flag = ["-s", ip_address]
-        self.device_state = DeviceState.DISCONNECTED
+        self.connection_state = connection_state
+    
+
+class ADB:
+    def __init__(self, path=ADB_PATH):
+        super()
+        self.path = ADB_PATH
+        self.check_adb()
+        
+    def check_adb(self):
+        if not os.path.isfile(self.path):
+            raise ValueError(f"ADB_PATH provided {ADB_PATH} is not a valid path to the adb executable")
+    
+    def _execute_command(self, *args, tries=1, check_err=True, check_adb_on_error=False) -> sp.CompletedProcess:
+        cmd = None
+        for i in range(tries):
+            try:
+                cmd = sp.run(
+                    self.path,
+                    *args,
+                    stdout=sp.PIPE,
+                    stderr=sp.PIPE,
+                    text=True
+                )
+                cmd.check_returncode()
+                return cmd
+            except sp.CalledProcessError as err:
+                if i == tries - 1 and check_err:
+                    if check_adb_on_error:
+                        self.check_adb()
+                    raise err
+        return cmd
+    
+    def kill_server(self):
+        self._execute_command("kill-server", tries=2, check_adb_on_error=True)
+    
+    def start_server(self):
+        self._execute_command("start-server", tries=2, check_adb_on_error=True)
+
+    def devices(self) -> List[Device]:
+        cmd = self._execute_command("devices", tries=2, check_adb_on_error=True)
+        
+        device_list = cmd.stdout.splitlines()
+        return list(
+            map(
+                lambda a: Device(
+                    a.split()[0],
+                    ConnectionState[a.split()[1]]
+                ),
+                device_list
+            )
+        )
+    
+    def connect(self, device: Device):
+        self._execute_command(
+            "connect",
+            device.ip_address,
+            tries=2,
+            check_adb_on_error=True
+        )
+
+    def disconnect(self, device: Device = None):
+        extra_args = []
+        if device is not None:
+            extra_args.append(device.ip_address)
+        
+        self._execute_command(
+            "disconnect", *extra_args, tries=2
+        )
+    
+    @staticmethod
+    def get_device_args(device: Device):
+        extra_args = []
+        if device is not None:
+            extra_args.append("-s")
+            extra_args.append(device.ip_address)
+
+    def shell(self, *args, device: Device = None, tries=1):
+        extra_args = ADB.get_device_args(device)
+        
+        self._execute_command(
+            *extra_args,
+            "shell",
+            *args,
+            tries=tries
+        )
+    
+    def install(self, package, device: Device = None):
+        extra_args = ADB.get_device_args(device)
+        
+        self._execute_command(
+            *extra_args,
+            "install",
+            package
+        )
+    
+    def uninstall(self, package, device: Device = None):
+        extra_args = ADB.get_device_args(device)
+        
+        no_package_search = re.compile(
+            f"^\s*java.lang.IllegalArgumentException:\sUnknown package:\s{package}\s*$",
+            flags=re.MULTILINE
+        )
+
+        try:
+            cmd = self._execute_command(
+                *extra_args,
+                "uninstall",
+                package,
+                check_err=False
+            )
+        except sp.CalledProcessError as err:
+            # Handle error from no package
+            if (err.stderr is not None and no_package_search.search(err.stderr)) or \
+                (err.stdout is not None and no_package_search.search(err.stdout)):
+                return False
+            else:
+                raise err
+        
+        if (err.stderr is not None and no_package_search.search(err.stderr)) or \
+            (err.stdout is not None and no_package_search.search(err.stdout)):
+            return False
+
+        return True
+    
+    def check_connection(self, device) -> ConnectionState:
+        for own_device in self.devices():
+            if own_device.ip_address.split(":")[0] == device.ip_address.split(":")[0]:
+                return own_device.connection_state
+        return False
+
+
+class Installer:
+    def __init__(self, device: Device, apk_path, adb: ADB = ADB(ADB_PATH)):
+        super()
+        self.device = device
+        self.adb = adb
+        self.device_state = ConnectionState.DISCONNECTED
         self.apk_path = apk_path
 
-    def connect(self) -> sp.Popen:
-        return sp.Popen(
-            ADB_PATH,
-            "connect",
-            self.ip_address,
-            stdout=sp.PIPE
-        )
+    def connect(self): 
+        self.adb.connect(self.device)
 
-    def check_connection(self) -> DeviceState:
-        handle = sp.Popen(
-            ADB_PATH,
-            "devices",
-            stdout=sp.PIPE
-        )
-
-        acceptable_devices = [
-            device for device in handle.stdout.readline if device.startswith(self.ip_address)
-        ]
-        
-        if handle.wait() != 1:
-            warnings.warn("Error checking device connection")
-        
-        if len(acceptable_devices) == 0:
-            return DeviceState.DISCONNECTED
-        elif len(acceptable_devices) > 1:
-            warnings.warn(
-                "Error checking if installer is connected because "
-                f"more than one device matched:\n{'\n'.join(acceptable_devices)}"
-            )
-            return DeviceState.DISCONNECTED
+    def reconnect(self, hard=False):
+        if hard:
+            self.adb.kill_server()
         else:
-            state_string = acceptable_devices.split()[1].upper()
-            if state_string not in DeviceState:
-                warnings.warn(f"Unexpected state received from `adb devices': {state_string}")
-            return DeviceState.get(
-                state_string,
-                DeviceState.DISCONNECTED
-            )
+            self.adb.disconnect()
+        self.connect()
     
-    def reconnect(self):
-        self.disconnect_all()
-        return self.connect()
+    def check_connection(self) -> ConnectionState:
+        try:
+            return self.adb.check_connection(self.device)
+        except sp.CalledProcessError:
+            return ConnectionState.DISCONNECTED
     
-    def disconnect_all(self):
-        disconnect_code = self.disconnect_all().wait()
-        if disconnect_code != 1:
-            warnings.warn(
-                f"Getting error disconnecting from device {disconnect_code}"
-            )
-
     def restart_server(self):
-        self.kill_server()
-
-        start_result = sp.Popen(
-            ADB_PATH,
-            "start-server"
-        )
-        if start_result != 1:
-            warnings.warn(
-                f"Error starting server with exit code {start_result}"
-            )
-        
-    def kill_server(self):
-        kill_result = sp.Popen(
-            ADB_PATH,
-            "kill-server"
-        ).wait()
-
-        if kill_result != 1:
-            warnings.warn(
-                f"Error killing server with error code {kill_result}"
-            )
+        self.adb.kill_server()
+        self.adb.start_server()
     
     def ensure_connection(self):
         # Starts an event loop to make sure the device is connected
@@ -105,9 +195,9 @@ class Installer:
             handle = self.connect()
             
             result = self.check_connection()
-            if result == DeviceState.CONNECTED:
+            if result == ConnectionState.CONNECTED:
                 break
-            elif result == DeviceState.DISCONNECTED:
+            elif result == ConnectionState.DISCONNECTED:
                 self.restart_server()
                 self.connect()
     
@@ -151,6 +241,6 @@ class Installer:
         
         if self.check_connection()  
         if connection_state == DeviceState.
-        if self.check_connection() != DeviceState.CONNECTED:
+        if self.check_connection() != ConnectionState.CONNECTED:
             self.reconnect()
 
